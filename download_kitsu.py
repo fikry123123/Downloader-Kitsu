@@ -1,0 +1,377 @@
+import gazu
+import requests
+import os
+import getpass
+import sys
+import time
+import json
+
+KITSU_HOST = "" 
+
+
+def sanitize(name):
+    """Membersihkan nama file/folder"""
+    if not name: return "Unnamed"
+    return "".join([c for c in name if c.isalnum() or c in (' ', '.', '_', '-')]).strip()
+
+def get_full_url(raw_url):
+    """Memperbaiki URL relatif"""
+    if not raw_url: return None
+    if raw_url.startswith("http"): return raw_url
+    
+    # Menggunakan global variable yang sudah diinput user
+    base = KITSU_HOST.replace("/api", "")
+    if raw_url.startswith("/"): return f"{base}{raw_url}"
+    return f"{base}/{raw_url}"
+
+def format_bytes(size):
+    if not size: return "Unknown"
+    try:
+        size = int(size)
+        power = 2**10
+        n = size
+        power_labels = {0 : '', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
+        count = 0
+        while n > power:
+            n /= power
+            count += 1
+        return f"{n:.2f} {power_labels.get(count, 'B')}"
+    except: return "Unknown"
+
+def generate_url_candidates(entity_type, entity_id):
+    """Membuat 3 variasi URL untuk menebak posisi file"""
+    base_no_api = KITSU_HOST.replace("/api", "") 
+    base_with_api = KITSU_HOST                   
+    
+    candidates = []
+    if entity_type == 'preview':
+        candidates.append(f"{base_with_api}/pictures/preview-files/{entity_id}/file")
+        candidates.append(f"{base_no_api}/pictures/preview-files/{entity_id}/file")
+        candidates.append(f"{base_with_api}/data/preview-files/{entity_id}/file")
+    elif entity_type == 'output':
+        candidates.append(f"{base_with_api}/data/output-files/{entity_id}/file")
+        candidates.append(f"{base_no_api}/data/output-files/{entity_id}/file")
+    elif entity_type == 'working':
+        candidates.append(f"{base_with_api}/data/working-files/{entity_id}/file")
+        candidates.append(f"{base_no_api}/data/working-files/{entity_id}/file")
+    return candidates
+
+def download_with_auto_fix(item, headers):
+    """Mencoba download dengan multiple URL candidates"""
+    folder = item['folder']
+    filename = item['filename']
+    
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    
+    filepath = os.path.join(folder, filename)
+    
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+        return True
+
+    url_list = []
+    if item.get('url'): url_list.append(item['url'])
+    url_list.extend(generate_url_candidates(item['type'], item['id']))
+
+    for url in url_list:
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+                if r.status_code == 404: continue 
+                r.raise_for_status()
+                with open(filepath, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                return True 
+        except Exception:
+            continue
+    return False
+
+# --- LOGIKA CACHE NAMA SEQUENCE ---
+PARENT_NAME_CACHE = {}
+
+def get_parent_name_direct(parent_id, headers):
+    """Tanya langsung ke server ID ini namanya siapa."""
+    if not parent_id: return "No_Parent"
+    
+    if parent_id in PARENT_NAME_CACHE:
+        return PARENT_NAME_CACHE[parent_id]
+    
+    try:
+        url = f"{KITSU_HOST}/data/entities/{parent_id}"
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            name = data.get('name', 'Unknown_Parent')
+            PARENT_NAME_CACHE[parent_id] = name 
+            return name
+    except:
+        pass
+    
+    return f"Parent_{parent_id[:8]}" 
+
+def resolve_sequence_name(entity, seq_map, headers):
+    """Deteksi Nama Sequence"""
+    if entity.get('sequence_name'):
+        return entity['sequence_name']
+
+    seq_id = entity.get('sequence_id')
+    if seq_id and seq_id in seq_map:
+        return seq_map[seq_id]
+
+    parent_id = entity.get('parent_id')
+    if parent_id and parent_id in seq_map:
+        return seq_map[parent_id]
+        
+    if parent_id:
+        real_name = get_parent_name_direct(parent_id, headers)
+        return real_name
+
+    return "No_Sequence"
+
+def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, headers):
+    entity_name = sanitize(entity['name'])
+    
+    if entity_type == 'Shot':
+        seq_name_raw = resolve_sequence_name(entity, seq_map, headers)
+        seq_name = sanitize(seq_name_raw)
+        base_folder = os.path.join(root_folder, seq_name, entity_name)
+    else:
+        type_name = sanitize(entity.get('asset_type_name', 'Props'))
+        base_folder = os.path.join(root_folder, "Assets", type_name, entity_name)
+
+    # 1. CEK PREVIEW
+    if entity.get('preview_file_id'):
+        try:
+            pf = gazu.files.get_preview_file(entity['preview_file_id'])
+            if pf:
+                base_name = pf.get('original_name') or pf.get('name') or entity_name
+                ext = pf.get('extension', 'mp4')
+                clean_name = sanitize(base_name)
+                if not clean_name.lower().endswith(f".{ext}"):
+                    clean_name = f"{clean_name}.{ext}"
+
+                download_queue.append({
+                    'type': 'preview',
+                    'id': pf['id'],
+                    'url': get_full_url(pf.get('url')),
+                    'folder': base_folder, 
+                    'filename': clean_name,
+                    'size': pf.get('file_size', 0)
+                })
+        except: pass
+
+    # 2. CEK TASKS
+    try:
+        if entity_type == 'Shot':
+            tasks = gazu.task.all_tasks_for_shot(entity)
+        else:
+            tasks = gazu.task.all_tasks_for_asset(entity)
+
+        for task in tasks:
+            task_type = sanitize(task['task_type_name'])
+            task_folder = os.path.join(base_folder, task_type)
+
+            if task.get('preview_file_id'):
+                try:
+                    pf = gazu.files.get_preview_file(task['preview_file_id'])
+                    if pf:
+                        base_name = pf.get('original_name') or pf.get('name')
+                        ext = pf.get('extension', 'mp4')
+                        clean_name = f"{task_type}_Preview_{sanitize(base_name)}.{ext}"
+
+                        download_queue.append({
+                            'type': 'preview',
+                            'id': pf['id'],
+                            'url': get_full_url(pf.get('url')),
+                            'folder': task_folder,
+                            'filename': clean_name,
+                            'size': pf.get('file_size', 0)
+                        })
+                except: pass
+
+            outputs = gazu.files.all_output_files_for_entity(task)
+            for out in outputs:
+                base_name = out.get('original_name') or out.get('name')
+                clean_name = f"{task_type}_Output_{sanitize(base_name)}"
+                download_queue.append({
+                    'type': 'output',
+                    'id': out['id'],
+                    'url': get_full_url(out.get('url')),
+                    'folder': task_folder,
+                    'filename': clean_name,
+                    'size': out.get('file_size', 0)
+                })
+
+            works = gazu.files.all_working_files_for_entity(task)
+            for work in works:
+                base_name = work.get('original_name') or work.get('name')
+                clean_name = f"{task_type}_SRC_{sanitize(base_name)}"
+                download_queue.append({
+                    'type': 'working',
+                    'id': work['id'],
+                    'url': get_full_url(work.get('url')),
+                    'folder': task_folder,
+                    'filename': clean_name,
+                    'size': work.get('file_size', 0)
+                })
+
+    except Exception: pass
+
+def main():
+    global KITSU_HOST  # Mengakses variable global
+    print("="*60)
+    print("   KITSU DOWNLOADER (Universal)")
+    print("="*60)
+
+    # --- 1. SETUP KONEKSI ---
+    while True:
+        try:
+            # Input URL Server
+            if not KITSU_HOST:
+                host_input = input("Masukkan URL Server Kitsu (cth: http://192.168.1.50/api): ").strip()
+                if not host_input:
+                    print("URL tidak boleh kosong.")
+                    continue
+                # Pastikan ada /api di ujungnya jika user lupa
+                if not host_input.endswith("/api"):
+                    host_input = f"{host_input}/api"
+                KITSU_HOST = host_input
+
+            print(f"Target Server: {KITSU_HOST}")
+            user_input = input("Username/Email : ")
+            pass_input = getpass.getpass("Password       : ")
+            
+            gazu.client.set_host(KITSU_HOST)
+            gazu.log_in(user_input, pass_input)
+            print(">> Login BERHASIL!\n")
+            break
+        except Exception as e:
+            print(f"!! Login GAGAL: {e}")
+            print("Cek kembali URL Server dan Username/Password Anda.\n")
+            KITSU_HOST = "" # Reset URL jika gagal agar bisa input ulang
+
+    # --- 2. AMBIL TOKEN ---
+    auth_headers = None
+    try:
+        client_instance = gazu.client.default_client
+        raw_tokens = client_instance.tokens
+        auth_headers = {"Authorization": f"Bearer {raw_tokens['access_token']}"}
+    except Exception as e:
+        print(f"[X] Gagal ambil token: {e}")
+        return
+
+    # --- 3. PILIH PROJECT ---
+    try:
+        all_projects = gazu.project.all_open_projects()
+    except:
+        print("Gagal ambil project."); return
+
+    if not all_projects:
+        print("Tidak ada project aktif ditemukan."); return
+
+    print("\n--- DAFTAR PROJECT ---")
+    for idx, proj in enumerate(all_projects):
+        print(f"[{idx+1}] {proj['name']}")
+    print("----------------------")
+
+    selected_project = None
+    while True:
+        try:
+            choice = input("Pilih nomor project: ")
+            idx = int(choice) - 1
+            if 0 <= idx < len(all_projects):
+                selected_project = all_projects[idx]
+                break
+        except ValueError: pass
+
+    # --- 4. PERSIAPAN FOLDER ---
+    home_dir = os.path.expanduser("~")
+    downloads_path = os.path.join(home_dir, "Downloads")
+    folder_name = f"Kitsu_{sanitize(selected_project['name'])}"
+    download_root = os.path.join(downloads_path, folder_name)
+
+    # --- 5. DEEP MAPPING ---
+    print("\n>> Membangun Peta Struktur (Episodes & Sequences)...")
+    seq_map = {}
+    
+    try:
+        episodes = gazu.episode.all_episodes_for_project(selected_project)
+        print(f"   Ditemukan {len(episodes)} Episodes.")
+        for ep in episodes:
+            seqs = gazu.sequence.all_sequences_for_episode(ep)
+            for s in seqs:
+                seq_map[s['id']] = s['name']
+        
+        root_seqs = gazu.sequence.all_sequences_for_project(selected_project)
+        for s in root_seqs:
+            seq_map[s['id']] = s['name']
+        print(f"   Total Sequence terdata: {len(seq_map)}")
+    except Exception as e:
+        print(f"   Warning: Mapping struktur tidak sempurna ({e})")
+
+    # --- 6. SCANNING ---
+    print(f"\n>> Menganalisis File di '{selected_project['name']}'...")
+    
+    download_queue = []
+    
+    shots = gazu.shot.all_shots_for_project(selected_project)
+    print(f"   Memproses {len(shots)} Shots...")
+    
+    for i, shot in enumerate(shots):
+        sys.stdout.write(f"\r   Scanning {i+1}/{len(shots)}...")
+        sys.stdout.flush()
+        scan_entity(shot, download_root, 'Shot', download_queue, seq_map, headers=auth_headers)
+
+    assets = gazu.asset.all_assets_for_project(selected_project)
+    if assets:
+        print(f"\n   Memproses {len(assets)} Assets...")
+        for i, asset in enumerate(assets):
+            sys.stdout.write(f"\r   Scanning {i+1}/{len(assets)}...")
+            sys.stdout.flush()
+            scan_entity(asset, download_root, 'Asset', download_queue, seq_map, headers=auth_headers)
+
+    # --- 7. EKSEKUSI ---
+    total_files = len(download_queue)
+    total_size = sum(item.get('size', 0) for item in download_queue)
+    human_size = format_bytes(total_size)
+
+    print("\n\n" + "="*60)
+    print("   HASIL ANALISIS")
+    print("="*60)
+    
+    if total_files == 0:
+        print("!! TIDAK ADA FILE !!")
+        return
+
+    print(f"Total File      : {total_files} files")
+    print(f"Estimasi Ukuran : {human_size}")
+    print(f"LOKASI SIMPAN   : {download_root}")
+    print("-" * 60)
+
+    while True:
+        confirm = input(f">> Download {human_size}? (y/n): ").lower()
+        if confirm == 'y': break
+        if confirm == 'n': print("Batal."); return
+
+    print("\n>> Memulai Download...")
+    success_count = 0
+    start_time = time.time()
+
+    for i, item in enumerate(download_queue):
+        percent = int((i + 1) / total_files * 100)
+        fname = item['filename']
+        if len(fname) > 35: fname = fname[:32] + "..."
+        
+        sys.stdout.write(f"\r[{percent}%] {fname}")
+        sys.stdout.flush()
+        
+        if download_with_auto_fix(item, headers=auth_headers):
+            success_count += 1
+
+    duration = time.time() - start_time
+    print(f"\n\nSELESAI dalam {duration:.1f} detik.")
+    print(f"Sukses: {success_count} / {total_files} file.")
+    print(f"Cek di Folder Downloads: {folder_name}")
+
+if __name__ == "__main__":
+    main()
