@@ -67,9 +67,20 @@ def download_with_auto_fix(item, headers):
     filepath = os.path.join(folder, filename)
     temp_filepath = filepath + ".tmp"
     
-    # Cek file yang sudah lengkap
-    if os.path.exists(filepath) and os.path.getsize(filepath) > 100:  # Min 100 bytes valid
-        return True
+    # Cek file yang sudah lengkap - validasi dengan expected size
+    if os.path.exists(filepath):
+        file_size = os.path.getsize(filepath)
+        expected_size = item.get('size', 0)
+        
+        # Jika file sudah ada dan size match atau cukup besar (min 1MB untuk video)
+        if file_size > 1000000 or (expected_size > 0 and file_size >= expected_size * 0.95):
+            return True
+        # Jika file ada tapi kecil (< 1MB), hapus dan download ulang
+        elif file_size < 1000000:
+            try:
+                os.remove(filepath)
+            except:
+                pass
 
     url_list = []
     if item.get('url'): url_list.append(item['url'])
@@ -80,7 +91,7 @@ def download_with_auto_fix(item, headers):
         for attempt in range(3):
             try:
                 # Timeout lebih panjang untuk file video besar
-                timeout = (30, 300)  # (connect, read) timeout
+                timeout = (30, 600)  # (connect, read) timeout - 10 menit untuk file besar
                 
                 with requests.get(url, headers=headers, stream=True, timeout=timeout, allow_redirects=True) as r:
                     if r.status_code == 404: 
@@ -89,51 +100,91 @@ def download_with_auto_fix(item, headers):
                         break  # Forbidden, skip URL ini
                     r.raise_for_status()
                     
+                    # Get content length dari header
+                    content_length = r.headers.get('content-length')
+                    expected_bytes = int(content_length) if content_length else 0
+                    
                     # Download ke file temporary dulu
                     with open(temp_filepath, 'wb') as f:
                         total_downloaded = 0
-                        for chunk in r.iter_content(chunk_size=65536):  # 64KB chunks lebih optimal
+                        for chunk in r.iter_content(chunk_size=524288):  # 512KB chunks
                             if chunk:
                                 f.write(chunk)
                                 total_downloaded += len(chunk)
                     
-                    # Cek file temporary valid (lebih dari 100 bytes)
-                    if os.path.getsize(temp_filepath) > 100:
+                    # Validasi ukuran file yang didownload
+                    temp_size = os.path.getsize(temp_filepath)
+                    
+                    # Cek valid: minimal 1MB untuk video, atau match dengan expected
+                    min_valid_size = 1000000  # 1MB minimum untuk file
+                    is_valid = False
+                    
+                    if expected_bytes > 0:
+                        # Jika tahu expected size, cek 95% match
+                        is_valid = temp_size >= expected_bytes * 0.95
+                    elif temp_size > min_valid_size:
+                        # Jika tidak tahu expected size tapi file besar, anggap valid
+                        is_valid = True
+                    elif temp_size > 100000:  # 100KB minimum
+                        # File di atas 100KB anggap valid
+                        is_valid = True
+                    
+                    if is_valid:
                         # Rename dari temp ke final
                         if os.path.exists(filepath):
-                            os.remove(filepath)  # Hapus file corrupt lama
+                            try:
+                                os.remove(filepath)
+                            except:
+                                pass
                         os.rename(temp_filepath, filepath)
                         return True
                     else:
-                        # File terlalu kecil, kemungkinan corrupt
-                        os.remove(temp_filepath)
+                        # File terlalu kecil atau tidak lengkap
+                        if os.path.exists(temp_filepath):
+                            os.remove(temp_filepath)
+                        # Jika ini bukan attempt terakhir, retry
+                        if attempt < 2:
+                            time.sleep(2)
                         continue
                         
             except requests.exceptions.Timeout:
                 # Timeout, hapus temp dan retry
                 if os.path.exists(temp_filepath):
-                    os.remove(temp_filepath)
+                    try:
+                        os.remove(temp_filepath)
+                    except:
+                        pass
                 if attempt < 2:
-                    time.sleep(2)  # Wait sebelum retry
+                    time.sleep(3)  # Wait sebelum retry
                 continue
             except requests.exceptions.ConnectionError:
                 # Connection error, retry
                 if os.path.exists(temp_filepath):
-                    os.remove(temp_filepath)
+                    try:
+                        os.remove(temp_filepath)
+                    except:
+                        pass
                 if attempt < 2:
-                    time.sleep(2)
+                    time.sleep(3)
                 continue
             except Exception as e:
                 # Error lain
                 if os.path.exists(temp_filepath):
-                    os.remove(temp_filepath)
+                    try:
+                        os.remove(temp_filepath)
+                    except:
+                        pass
                 if attempt < 2:
+                    time.sleep(2)
                     continue
                 break
     
     # Cleanup jika masih ada temp file
     if os.path.exists(temp_filepath):
-        os.remove(temp_filepath)
+        try:
+            os.remove(temp_filepath)
+        except:
+            pass
     
     return False
 
@@ -243,7 +294,10 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, heade
             outputs = gazu.files.all_output_files_for_entity(task)
             for out in outputs:
                 base_name = out.get('original_name') or out.get('name')
+                ext = out.get('extension', '')  # Ambil extension
                 clean_name = f"{task_type}_Output_{sanitize(base_name)}"
+                if ext and not clean_name.lower().endswith(f".{ext}"):
+                    clean_name = f"{clean_name}.{ext}"
                 download_queue.append({
                     'type': 'output',
                     'id': out['id'],
@@ -256,7 +310,10 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, heade
             works = gazu.files.all_working_files_for_entity(task)
             for work in works:
                 base_name = work.get('original_name') or work.get('name')
+                ext = work.get('extension', '')  # Ambil extension
                 clean_name = f"{task_type}_SRC_{sanitize(base_name)}"
+                if ext and not clean_name.lower().endswith(f".{ext}"):
+                    clean_name = f"{clean_name}.{ext}"
                 download_queue.append({
                     'type': 'working',
                     'id': work['id'],
@@ -405,24 +462,38 @@ def main():
         if confirm == 'n': print("Batal."); return
 
     print("\n>> Memulai Download...")
+    print("   (File < 1MB akan di-redownload otomatis jika sudah ada)\n")
     success_count = 0
+    failed_count = 0
+    downloaded_size = 0
     start_time = time.time()
 
     for i, item in enumerate(download_queue):
         percent = int((i + 1) / total_files * 100)
         fname = item['filename']
-        if len(fname) > 35: fname = fname[:32] + "..."
+        file_size_display = format_bytes(item.get('size', 0))
         
-        sys.stdout.write(f"\r[{percent}%] {fname}")
+        if len(fname) > 30: fname = fname[:27] + "..."
+        
+        sys.stdout.write(f"\r[{percent}%] {fname:<33} ({file_size_display})")
         sys.stdout.flush()
         
         if download_with_auto_fix(item, headers=auth_headers):
             success_count += 1
+            downloaded_size += item.get('size', 0)
+        else:
+            failed_count += 1
 
     duration = time.time() - start_time
-    print(f"\n\nSELESAI dalam {duration:.1f} detik.")
-    print(f"Sukses: {success_count} / {total_files} file.")
-    print(f"Cek di Folder Downloads: {folder_name}")
+    actual_downloaded = format_bytes(downloaded_size)
+    
+    print(f"\n\n" + "="*60)
+    print(f"SELESAI dalam {duration:.1f} detik.")
+    print(f"Sukses   : {success_count} / {total_files} file")
+    print(f"Gagal    : {failed_count} / {total_files} file")
+    print(f"Ukuran   : {actual_downloaded} (dari {human_size} estimasi)")
+    print(f"Folder   : {download_root}")
+    print("="*60)
 
 if __name__ == "__main__":
     main()
