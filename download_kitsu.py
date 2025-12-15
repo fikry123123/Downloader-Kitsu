@@ -246,13 +246,38 @@ def resolve_sequence_name(entity, seq_map, headers):
 
     return "No_Sequence"
 
-def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, headers):
+def resolve_episode_and_sequence(entity, seq_map, seq_episode_map, episode_map, headers):
+    """Mengembalikan nama Episode dan Sequence untuk sebuah Shot."""
+    seq_name_raw = resolve_sequence_name(entity, seq_map, headers)
+    seq_name = sanitize(seq_name_raw)
+
+    episode_name = "No_Episode"
+
+    seq_id = entity.get('sequence_id') or entity.get('parent_id')
+    ep_id = entity.get('episode_id')
+
+    if not ep_id and seq_id and seq_id in seq_episode_map:
+        ep_id = seq_episode_map[seq_id]
+
+    if ep_id and ep_id in episode_map:
+        episode_name = episode_map[ep_id]
+    elif ep_id:
+        episode_name = get_parent_name_direct(ep_id, headers)
+
+    return sanitize(episode_name), seq_name
+
+def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, episode_map, seq_episode_map, headers):
     entity_name = sanitize(entity['name'])
     
     if entity_type == 'Shot':
-        seq_name_raw = resolve_sequence_name(entity, seq_map, headers)
-        seq_name = sanitize(seq_name_raw)
-        base_folder = os.path.join(root_folder, seq_name, entity_name)
+        episode_name, seq_name = resolve_episode_and_sequence(
+            entity,
+            seq_map=seq_map,
+            seq_episode_map=seq_episode_map,
+            episode_map=episode_map,
+            headers=headers
+        )
+        base_folder = os.path.join(root_folder, episode_name, seq_name, entity_name)
     else:
         type_name = sanitize(entity.get('asset_type_name', 'Props'))
         base_folder = os.path.join(root_folder, "Assets", type_name, entity_name)
@@ -434,18 +459,27 @@ def main():
     # --- 5. DEEP MAPPING ---
     print("\n>> Membangun Peta Struktur (Episodes & Sequences)...")
     seq_map = {}
+    episode_map = {}
+    seq_episode_map = {}
     
     try:
         episodes = gazu.episode.all_episodes_for_project(selected_project)
         print(f"   Ditemukan {len(episodes)} Episodes.")
         for ep in episodes:
+            episode_map[ep['id']] = ep['name']
             seqs = gazu.sequence.all_sequences_for_episode(ep)
             for s in seqs:
                 seq_map[s['id']] = s['name']
+                seq_episode_map[s['id']] = ep['id']
         
         root_seqs = gazu.sequence.all_sequences_for_project(selected_project)
         for s in root_seqs:
             seq_map[s['id']] = s['name']
+            ep_id = s.get('episode_id')
+            if ep_id:
+                seq_episode_map[s['id']] = ep_id
+                if ep_id not in episode_map:
+                    episode_map[ep_id] = get_parent_name_direct(ep_id, auth_headers)
         print(f"   Total Sequence terdata: {len(seq_map)}")
     except Exception as e:
         print(f"   Warning: Mapping struktur tidak sempurna ({e})")
@@ -461,7 +495,16 @@ def main():
     for i, shot in enumerate(shots):
         sys.stdout.write(f"\r   Scanning {i+1}/{len(shots)}...")
         sys.stdout.flush()
-        scan_entity(shot, download_root, 'Shot', download_queue, seq_map, headers=auth_headers)
+        scan_entity(
+            shot,
+            download_root,
+            'Shot',
+            download_queue,
+            seq_map,
+            episode_map,
+            seq_episode_map,
+            headers=auth_headers
+        )
 
     assets = gazu.asset.all_assets_for_project(selected_project)
     if assets:
@@ -469,7 +512,16 @@ def main():
         for i, asset in enumerate(assets):
             sys.stdout.write(f"\r   Scanning {i+1}/{len(assets)}...")
             sys.stdout.flush()
-            scan_entity(asset, download_root, 'Asset', download_queue, seq_map, headers=auth_headers)
+            scan_entity(
+                asset,
+                download_root,
+                'Asset',
+                download_queue,
+                seq_map,
+                episode_map,
+                seq_episode_map,
+                headers=auth_headers
+            )
 
     # --- 7. EKSEKUSI ---
     total_files = len(download_queue)
