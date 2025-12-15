@@ -39,21 +39,29 @@ def format_bytes(size):
     except: return "Unknown"
 
 def generate_url_candidates(entity_type, entity_id):
-    """Membuat 3 variasi URL untuk menebak posisi file"""
-    base_no_api = KITSU_HOST.replace("/api", "") 
-    base_with_api = KITSU_HOST                   
+    """Membuat berbagai variasi URL untuk download file"""
+    base_no_api = KITSU_HOST.replace("/api", "")
+    base_api = KITSU_HOST
     
     candidates = []
     if entity_type == 'preview':
-        candidates.append(f"{base_with_api}/pictures/preview-files/{entity_id}/file")
-        candidates.append(f"{base_no_api}/pictures/preview-files/{entity_id}/file")
-        candidates.append(f"{base_with_api}/data/preview-files/{entity_id}/file")
+        # Try both pictures dan movies endpoint (Kitsu menyimpan preview di kedua tempat)
+        candidates.append(f"{base_api}/movies/originals/preview-files/{entity_id}/download")
+        candidates.append(f"{base_api}/pictures/originals/preview-files/{entity_id}/download")
+        candidates.append(f"{base_api}/movies/preview-files/{entity_id}/download")
+        candidates.append(f"{base_api}/pictures/preview-files/{entity_id}/download")
+        # Fallback variants
+        candidates.append(f"{base_no_api}/api/movies/originals/preview-files/{entity_id}/download")
+        candidates.append(f"{base_no_api}/api/pictures/originals/preview-files/{entity_id}/download")
+        
     elif entity_type == 'output':
-        candidates.append(f"{base_with_api}/data/output-files/{entity_id}/file")
-        candidates.append(f"{base_no_api}/data/output-files/{entity_id}/file")
+        candidates.append(f"{base_api}/data/output-files/{entity_id}/download")
+        candidates.append(f"{base_api}/data/output-files/{entity_id}/file")
+        
     elif entity_type == 'working':
-        candidates.append(f"{base_with_api}/data/working-files/{entity_id}/file")
-        candidates.append(f"{base_no_api}/data/working-files/{entity_id}/file")
+        candidates.append(f"{base_api}/data/working-files/{entity_id}/download")
+        candidates.append(f"{base_api}/data/working-files/{entity_id}/file")
+    
     return candidates
 
 def download_with_auto_fix(item, headers):
