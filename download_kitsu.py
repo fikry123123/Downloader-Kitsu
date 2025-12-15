@@ -57,7 +57,7 @@ def generate_url_candidates(entity_type, entity_id):
     return candidates
 
 def download_with_auto_fix(item, headers):
-    """Mencoba download dengan multiple URL candidates"""
+    """Mencoba download dengan multiple URL candidates dan retry logic"""
     folder = item['folder']
     filename = item['filename']
     
@@ -65,25 +65,76 @@ def download_with_auto_fix(item, headers):
         os.makedirs(folder)
     
     filepath = os.path.join(folder, filename)
+    temp_filepath = filepath + ".tmp"
     
-    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+    # Cek file yang sudah lengkap
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 100:  # Min 100 bytes valid
         return True
 
     url_list = []
     if item.get('url'): url_list.append(item['url'])
     url_list.extend(generate_url_candidates(item['type'], item['id']))
 
+    # Retry logic - coba setiap URL hingga 3 kali
     for url in url_list:
-        try:
-            with requests.get(url, headers=headers, stream=True, timeout=60) as r:
-                if r.status_code == 404: continue 
-                r.raise_for_status()
-                with open(filepath, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                return True 
-        except Exception:
-            continue
+        for attempt in range(3):
+            try:
+                # Timeout lebih panjang untuk file video besar
+                timeout = (30, 300)  # (connect, read) timeout
+                
+                with requests.get(url, headers=headers, stream=True, timeout=timeout, allow_redirects=True) as r:
+                    if r.status_code == 404: 
+                        break  # URL tidak ada, coba URL berikutnya
+                    if r.status_code == 403:
+                        break  # Forbidden, skip URL ini
+                    r.raise_for_status()
+                    
+                    # Download ke file temporary dulu
+                    with open(temp_filepath, 'wb') as f:
+                        total_downloaded = 0
+                        for chunk in r.iter_content(chunk_size=65536):  # 64KB chunks lebih optimal
+                            if chunk:
+                                f.write(chunk)
+                                total_downloaded += len(chunk)
+                    
+                    # Cek file temporary valid (lebih dari 100 bytes)
+                    if os.path.getsize(temp_filepath) > 100:
+                        # Rename dari temp ke final
+                        if os.path.exists(filepath):
+                            os.remove(filepath)  # Hapus file corrupt lama
+                        os.rename(temp_filepath, filepath)
+                        return True
+                    else:
+                        # File terlalu kecil, kemungkinan corrupt
+                        os.remove(temp_filepath)
+                        continue
+                        
+            except requests.exceptions.Timeout:
+                # Timeout, hapus temp dan retry
+                if os.path.exists(temp_filepath):
+                    os.remove(temp_filepath)
+                if attempt < 2:
+                    time.sleep(2)  # Wait sebelum retry
+                continue
+            except requests.exceptions.ConnectionError:
+                # Connection error, retry
+                if os.path.exists(temp_filepath):
+                    os.remove(temp_filepath)
+                if attempt < 2:
+                    time.sleep(2)
+                continue
+            except Exception as e:
+                # Error lain
+                if os.path.exists(temp_filepath):
+                    os.remove(temp_filepath)
+                if attempt < 2:
+                    continue
+                break
+    
+    # Cleanup jika masih ada temp file
+    if os.path.exists(temp_filepath):
+        os.remove(temp_filepath)
+    
     return False
 
 # --- LOGIKA CACHE NAMA SEQUENCE ---
