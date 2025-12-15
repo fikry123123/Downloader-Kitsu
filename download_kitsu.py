@@ -288,7 +288,11 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, heade
         for task in tasks:
             task_type = sanitize(task['task_type_name'])
             task_folder = os.path.join(base_folder, task_type)
+            
+            # Collect semua file untuk task ini dulu
+            task_files = []
 
+            # Preview file
             if task.get('preview_file_id'):
                 try:
                     pf = gazu.files.get_preview_file(task['preview_file_id'])
@@ -297,7 +301,7 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, heade
                         ext = pf.get('extension', 'mp4')
                         clean_name = f"{task_type}_Preview_{sanitize(base_name)}.{ext}"
 
-                        download_queue.append({
+                        task_files.append({
                             'type': 'preview',
                             'id': pf['id'],
                             'url': get_full_url(pf.get('url')),
@@ -307,14 +311,15 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, heade
                         })
                 except: pass
 
+            # Output files
             outputs = gazu.files.all_output_files_for_entity(task)
             for out in outputs:
                 base_name = out.get('original_name') or out.get('name')
-                ext = out.get('extension', '')  # Ambil extension
+                ext = out.get('extension', '')
                 clean_name = f"{task_type}_Output_{sanitize(base_name)}"
                 if ext and not clean_name.lower().endswith(f".{ext}"):
                     clean_name = f"{clean_name}.{ext}"
-                download_queue.append({
+                task_files.append({
                     'type': 'output',
                     'id': out['id'],
                     'url': get_full_url(out.get('url')),
@@ -323,14 +328,15 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, heade
                     'size': out.get('file_size', 0)
                 })
 
+            # Working files
             works = gazu.files.all_working_files_for_entity(task)
             for work in works:
                 base_name = work.get('original_name') or work.get('name')
-                ext = work.get('extension', '')  # Ambil extension
+                ext = work.get('extension', '')
                 clean_name = f"{task_type}_SRC_{sanitize(base_name)}"
                 if ext and not clean_name.lower().endswith(f".{ext}"):
                     clean_name = f"{clean_name}.{ext}"
-                download_queue.append({
+                task_files.append({
                     'type': 'working',
                     'id': work['id'],
                     'url': get_full_url(work.get('url')),
@@ -338,6 +344,10 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, heade
                     'filename': clean_name,
                     'size': work.get('file_size', 0)
                 })
+
+            # Hanya tambahkan ke download_queue jika ada file
+            if task_files:
+                download_queue.extend(task_files)
 
     except Exception: pass
 
