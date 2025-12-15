@@ -61,8 +61,16 @@ def download_with_auto_fix(item, headers):
     folder = item['folder']
     filename = item['filename']
     
-    if not os.path.exists(folder):
-        os.makedirs(folder)
+    # Buat folder dengan error handling yang lebih baik
+    try:
+        if not os.path.exists(folder):
+            os.makedirs(folder, exist_ok=True)
+        
+        # Cek write permission
+        if not os.access(folder, os.W_OK):
+            return False
+    except Exception as e:
+        return False
     
     filepath = os.path.join(folder, filename)
     temp_filepath = filepath + ".tmp"
@@ -397,6 +405,13 @@ def main():
     downloads_path = os.path.join(home_dir, "Downloads")
     folder_name = f"Kitsu_{sanitize(selected_project['name'])}"
     download_root = os.path.join(downloads_path, folder_name)
+    
+    # Buat folder root jika belum ada
+    try:
+        os.makedirs(download_root, exist_ok=True)
+    except Exception as e:
+        print(f"[X] Gagal membuat folder: {e}")
+        return
 
     # --- 5. DEEP MAPPING ---
     print("\n>> Membangun Peta Struktur (Episodes & Sequences)...")
@@ -462,6 +477,7 @@ def main():
         if confirm == 'n': print("Batal."); return
 
     print("\n>> Memulai Download...")
+    print(f"   Menyimpan ke: {download_root}")
     print("   (File < 1MB akan di-redownload otomatis jika sudah ada)\n")
     success_count = 0
     failed_count = 0
@@ -487,11 +503,26 @@ def main():
     duration = time.time() - start_time
     actual_downloaded = format_bytes(downloaded_size)
     
+    # Hitung total file yang ada di folder
+    total_downloaded_files = 0
+    total_downloaded_bytes = 0
+    try:
+        for root, dirs, files in os.walk(download_root):
+            for file in files:
+                if not file.endswith('.tmp'):
+                    total_downloaded_files += 1
+                    total_downloaded_bytes += os.path.getsize(os.path.join(root, file))
+    except:
+        pass
+    
+    actual_size_display = format_bytes(total_downloaded_bytes)
+    
     print(f"\n\n" + "="*60)
     print(f"SELESAI dalam {duration:.1f} detik.")
     print(f"Sukses   : {success_count} / {total_files} file")
     print(f"Gagal    : {failed_count} / {total_files} file")
-    print(f"Ukuran   : {actual_downloaded} (dari {human_size} estimasi)")
+    print(f"File Ada : {total_downloaded_files} file ({actual_size_display})")
+    print(f"Estimasi : {human_size}")
     print(f"Folder   : {download_root}")
     print("="*60)
 
