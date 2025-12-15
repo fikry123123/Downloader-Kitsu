@@ -246,6 +246,60 @@ def resolve_sequence_name(entity, seq_map, headers):
 
     return "No_Sequence"
 
+def normalize_list_response(payload):
+    """Normalisasi response list dari API (kadang dibungkus key data)."""
+    if isinstance(payload, dict) and 'data' in payload:
+        payload = payload['data']
+    return payload if isinstance(payload, list) else []
+
+def get_episodes_for_project(project, headers):
+    """Ambil daftar episode; fallback ke request manual jika modul gazu.episode tidak ada."""
+    if hasattr(gazu, "episode") and hasattr(gazu.episode, "all_episodes_for_project"):
+        try:
+            return gazu.episode.all_episodes_for_project(project)
+        except Exception:
+            pass
+    try:
+        url = f"{KITSU_HOST}/data/episodes?project_id={project['id']}"
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            return normalize_list_response(r.json())
+    except Exception:
+        pass
+    return []
+
+def get_sequences_for_episode(episode, headers):
+    """Ambil sequence untuk sebuah episode; gunakan REST jika fungsi gazu tidak ada."""
+    if hasattr(gazu, "sequence") and hasattr(gazu.sequence, "all_sequences_for_episode"):
+        try:
+            return gazu.sequence.all_sequences_for_episode(episode)
+        except Exception:
+            pass
+    try:
+        url = f"{KITSU_HOST}/data/sequences?episode_id={episode['id']}"
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            return normalize_list_response(r.json())
+    except Exception:
+        pass
+    return []
+
+def get_sequences_for_project(project, headers):
+    """Ambil sequence langsung dari project (untuk sequence tanpa episode)."""
+    if hasattr(gazu, "sequence") and hasattr(gazu.sequence, "all_sequences_for_project"):
+        try:
+            return gazu.sequence.all_sequences_for_project(project)
+        except Exception:
+            pass
+    try:
+        url = f"{KITSU_HOST}/data/sequences?project_id={project['id']}"
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            return normalize_list_response(r.json())
+    except Exception:
+        pass
+    return []
+
 def resolve_episode_and_sequence(entity, seq_map, seq_episode_map, episode_map, headers):
     """Mengembalikan nama Episode dan Sequence untuk sebuah Shot."""
     seq_name_raw = resolve_sequence_name(entity, seq_map, headers)
@@ -463,16 +517,16 @@ def main():
     seq_episode_map = {}
     
     try:
-        episodes = gazu.episode.all_episodes_for_project(selected_project)
+        episodes = get_episodes_for_project(selected_project, auth_headers)
         print(f"   Ditemukan {len(episodes)} Episodes.")
         for ep in episodes:
             episode_map[ep['id']] = ep['name']
-            seqs = gazu.sequence.all_sequences_for_episode(ep)
+            seqs = get_sequences_for_episode(ep, auth_headers)
             for s in seqs:
                 seq_map[s['id']] = s['name']
                 seq_episode_map[s['id']] = ep['id']
         
-        root_seqs = gazu.sequence.all_sequences_for_project(selected_project)
+        root_seqs = get_sequences_for_project(selected_project, auth_headers)
         for s in root_seqs:
             seq_map[s['id']] = s['name']
             ep_id = s.get('episode_id')
