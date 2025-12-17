@@ -5,8 +5,10 @@ import getpass
 import sys
 import time
 import json
+from datetime import datetime
 
 KITSU_HOST = "" 
+CACHE_FILENAME = "kitsu_scan_cache.json"
 
 # ==========================================
 # UTILITY FUNCTIONS
@@ -40,8 +42,50 @@ def format_bytes(size):
         return f"{n:.2f} {power_labels.get(count, 'B')}"
     except: return "Unknown"
 
+# ==========================================
+# CACHE FILE HANDLERS (BARU)
+# ==========================================
+
+def save_cache_to_disk(cache_data):
+    """Menyimpan data hasil scan ke file JSON"""
+    try:
+        data_wrapper = {
+            "timestamp": time.time(),
+            "date_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "data": cache_data
+        }
+        with open(CACHE_FILENAME, 'w') as f:
+            json.dump(data_wrapper, f, indent=2)
+        print(f"\n[INFO] Data scan berhasil disimpan ke '{CACHE_FILENAME}'")
+    except Exception as e:
+        print(f"[WARNING] Gagal menyimpan cache: {e}")
+
+def load_cache_from_disk():
+    """Membaca file cache jika ada"""
+    if not os.path.exists(CACHE_FILENAME):
+        return None
+    
+    try:
+        with open(CACHE_FILENAME, 'r') as f:
+            wrapper = json.load(f)
+            
+        # JSON keys selalu string, kita harus convert keys kembali ke integer
+        # agar sesuai dengan index list project
+        raw_data = wrapper.get("data", {})
+        processed_data = {}
+        for k, v in raw_data.items():
+            processed_data[int(k)] = v
+            
+        return processed_data, wrapper.get("date_str", "Unknown Date")
+    except Exception as e:
+        print(f"[WARNING] File cache rusak atau tidak valid: {e}")
+        return None
+
+# ==========================================
+# DOWNLOAD URL LOGIC
+# ==========================================
+
 def generate_url_candidates(entity_type, entity_id):
-    """Membuat berbagai variasi URL untuk download file"""
     base_no_api = KITSU_HOST.replace("/api", "")
     base_api = KITSU_HOST
     
@@ -64,12 +108,7 @@ def generate_url_candidates(entity_type, entity_id):
     
     return candidates
 
-# ==========================================
-# DOWNLOAD LOGIC
-# ==========================================
-
 def download_with_auto_fix(item, headers):
-    """Mencoba download dengan multiple URL candidates dan retry logic"""
     folder = item['folder']
     filename = item['filename']
     
@@ -84,17 +123,13 @@ def download_with_auto_fix(item, headers):
     filepath = os.path.join(folder, filename)
     temp_filepath = filepath + ".tmp"
     
-    # Smart skip logic
     if os.path.exists(filepath):
         file_size = os.path.getsize(filepath)
         expected_size = item.get('size', 0)
-        
-        # Validasi file yang ada
         if file_size > 1000000 or (expected_size > 0 and file_size >= expected_size * 0.95):
             return True
         elif file_size < 1000000:
-            try:
-                os.remove(filepath)
+            try: os.remove(filepath)
             except: pass
 
     url_list = []
@@ -106,8 +141,7 @@ def download_with_auto_fix(item, headers):
             try:
                 timeout = (30, 600)
                 with requests.get(url, headers=headers, stream=True, timeout=timeout, allow_redirects=True) as r:
-                    if r.status_code in [404, 403]: 
-                        break 
+                    if r.status_code in [404, 403]: break 
                     r.raise_for_status()
                     
                     content_length = r.headers.get('content-length')
@@ -122,10 +156,8 @@ def download_with_auto_fix(item, headers):
                     
                     if expected_bytes > 0:
                         is_valid = temp_size >= expected_bytes * 0.95
-                    elif temp_size > 1000000: # > 1MB valid
-                        is_valid = True
-                    elif temp_size > 100000:  # > 100KB valid
-                        is_valid = True
+                    elif temp_size > 1000000: is_valid = True
+                    elif temp_size > 100000: is_valid = True
                     
                     if is_valid:
                         if os.path.exists(filepath):
@@ -138,7 +170,7 @@ def download_with_auto_fix(item, headers):
                         if attempt < 2: time.sleep(2)
                         continue
                         
-            except Exception as e:
+            except Exception:
                 if os.path.exists(temp_filepath):
                     try: os.remove(temp_filepath)
                     except: pass
@@ -154,14 +186,13 @@ def download_with_auto_fix(item, headers):
     return False
 
 # ==========================================
-# CACHE & MAPPING LOGIC
+# SCANNING & MAPPING LOGIC
 # ==========================================
 PARENT_NAME_CACHE = {}
 
 def get_parent_name_direct(parent_id, headers):
     if not parent_id: return "No_Parent"
     if parent_id in PARENT_NAME_CACHE: return PARENT_NAME_CACHE[parent_id]
-    
     try:
         url = f"{KITSU_HOST}/data/entities/{parent_id}"
         r = requests.get(url, headers=headers, timeout=10)
@@ -182,8 +213,7 @@ def resolve_sequence_name(entity, seq_map, headers):
     return "No_Sequence"
 
 def normalize_list_response(payload):
-    if isinstance(payload, dict) and 'data' in payload:
-        payload = payload['data']
+    if isinstance(payload, dict) and 'data' in payload: payload = payload['data']
     return payload if isinstance(payload, list) else []
 
 def get_episodes_for_project(project, headers):
@@ -236,10 +266,6 @@ def resolve_episode_and_sequence(entity, seq_map, seq_episode_map, episode_map, 
 
     return sanitize(episode_name), seq_name
 
-# ==========================================
-# SCANNING LOGIC
-# ==========================================
-
 def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, episode_map, seq_episode_map, headers):
     entity_name = sanitize(entity['name'])
     
@@ -252,7 +278,7 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, episo
         type_name = sanitize(entity.get('asset_type_name', 'Props'))
         base_folder = os.path.join(root_folder, "Assets", type_name, entity_name)
 
-    # 1. CEK PREVIEW
+    # Preview
     if entity.get('preview_file_id'):
         try:
             pf = gazu.files.get_preview_file(entity['preview_file_id'])
@@ -260,32 +286,23 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, episo
                 base_name = pf.get('original_name') or pf.get('name') or entity_name
                 ext = pf.get('extension', 'mp4')
                 clean_name = sanitize(base_name)
-                if not clean_name.lower().endswith(f".{ext}"):
-                    clean_name = f"{clean_name}.{ext}"
-
+                if not clean_name.lower().endswith(f".{ext}"): clean_name = f"{clean_name}.{ext}"
                 download_queue.append({
-                    'type': 'preview',
-                    'id': pf['id'],
-                    'url': get_full_url(pf.get('url')),
-                    'folder': base_folder, 
-                    'filename': clean_name,
-                    'size': pf.get('file_size', 0)
+                    'type': 'preview', 'id': pf['id'], 'url': get_full_url(pf.get('url')),
+                    'folder': base_folder, 'filename': clean_name, 'size': pf.get('file_size', 0)
                 })
         except: pass
 
-    # 2. CEK TASKS
+    # Tasks
     try:
-        if entity_type == 'Shot':
-            tasks = gazu.task.all_tasks_for_shot(entity)
-        else:
-            tasks = gazu.task.all_tasks_for_asset(entity)
+        if entity_type == 'Shot': tasks = gazu.task.all_tasks_for_shot(entity)
+        else: tasks = gazu.task.all_tasks_for_asset(entity)
 
         for task in tasks:
             task_type = sanitize(task['task_type_name'])
             task_folder = os.path.join(base_folder, task_type)
             task_files = []
 
-            # Preview file
             if task.get('preview_file_id'):
                 try:
                     pf = gazu.files.get_preview_file(task['preview_file_id'])
@@ -299,7 +316,6 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, episo
                         })
                 except: pass
 
-            # Output files
             outputs = gazu.files.all_output_files_for_entity(task)
             for out in outputs:
                 base_name = out.get('original_name') or out.get('name')
@@ -311,7 +327,6 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, episo
                     'folder': task_folder, 'filename': clean_name, 'size': out.get('file_size', 0)
                 })
 
-            # Working files
             works = gazu.files.all_working_files_for_entity(task)
             for work in works:
                 base_name = work.get('original_name') or work.get('name')
@@ -323,20 +338,16 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, episo
                     'folder': task_folder, 'filename': clean_name, 'size': work.get('file_size', 0)
                 })
 
-            if task_files:
-                download_queue.extend(task_files)
+            if task_files: download_queue.extend(task_files)
     except Exception: pass
 
 def analyze_single_project(project, auth_headers, proj_idx, total_projects):
-    """Scan satu project dan return (total_size, total_files, download_queue) dengan progress bar"""
-    
-    # Setup dummy download root hanya untuk struktur folder di queue
+    """Scan satu project dan return (total_size, total_files, download_queue)"""
     home_dir = os.path.expanduser("~")
     downloads_path = os.path.join(home_dir, "Downloads")
     folder_name = f"Kitsu_{sanitize(project['name'])}"
     download_root = os.path.join(downloads_path, folder_name)
 
-    # Building Maps
     seq_map = {}
     episode_map = {}
     seq_episode_map = {}
@@ -362,10 +373,8 @@ def analyze_single_project(project, auth_headers, proj_idx, total_projects):
 
     download_queue = []
     
-    # 1. Fetch Lists First
     shots = gazu.shot.all_shots_for_project(project)
     assets = gazu.asset.all_assets_for_project(project)
-    
     total_items = len(shots) + len(assets)
     processed_count = 0
     
@@ -389,7 +398,6 @@ def analyze_single_project(project, auth_headers, proj_idx, total_projects):
             scan_entity(asset, download_root, 'Asset', download_queue, seq_map, episode_map, seq_episode_map, auth_headers)
             
     total_size = sum(item.get('size', 0) for item in download_queue)
-    
     sys.stdout.write(f"\r>> [{proj_idx}/{total_projects}] Menganalisis '{project['name']}' ... [DONE] Found {len(download_queue)} files ({format_bytes(total_size)})   \n")
     sys.stdout.flush()
     
@@ -402,7 +410,7 @@ def analyze_single_project(project, auth_headers, proj_idx, total_projects):
 def main():
     global KITSU_HOST 
     print("="*60)
-    print("   KITSU DOWNLOADER - ANALYZER MODE")
+    print("   KITSU DOWNLOADER - SMART CACHE MODE")
     print("="*60)
 
     # --- 1. SETUP KONEKSI ---
@@ -445,36 +453,69 @@ def main():
     if not all_projects:
         print("Tidak ada project aktif."); return
 
-    # --- 4. ANALISIS SEMUA PROJECT (SEKALI SAJA DI AWAL) ---
+    # --- 4. CEK CACHE ATAU SCAN BARU ---
     PROJECT_CACHE = {} 
     
-    print("="*60)
-    print(f">> MEMULAI ANALISIS {len(all_projects)} PROJECT...")
-    print("   (Data akan disimpan di memori agar Anda tidak perlu scan ulang)")
-    print("="*60)
+    # Cek apakah ada file cache
+    loaded_cache_data, cache_date = load_cache_from_disk() or (None, None)
+    use_cache = False
 
-    for idx, proj in enumerate(all_projects):
-        try:
-            p_size, p_files, p_queue, p_root = analyze_single_project(proj, auth_headers, idx+1, len(all_projects))
-            PROJECT_CACHE[idx] = {
-                'project': proj,
-                'total_size': p_size,
-                'total_files': p_files,
-                'queue': p_queue,
-                'download_root': p_root
-            }
-        except Exception as e:
-            print(f"\n[X] Error analyzing {proj['name']}: {e}")
-            PROJECT_CACHE[idx] = None 
+    if loaded_cache_data:
+        print("="*60)
+        print(f"DITEMUKAN DATA SCAN TERSIMPAN!")
+        print(f"Tanggal Scan: {cache_date}")
+        print("="*60)
+        confirm_cache = input(">> Gunakan data lama (tidak perlu scan ulang)? (y/n): ").lower().strip()
+        if confirm_cache == 'y':
+            use_cache = True
+            # Kita perlu memetakan data cache ke project list saat ini
+            # Karena index mungkin berubah jika ada project baru, kita akan pakai scan sederhana
+            # Tapi untuk script ini, kita asumsi urutan project relatif sama atau kita mapping by index
+            # Note: Cache disimpan by index (0, 1, 2).
+            PROJECT_CACHE = loaded_cache_data
+            print("\n>> Data berhasil dimuat dari file.")
+        else:
+            print(">> Melakukan scan ulang...")
+
+    if not use_cache:
+        print("="*60)
+        print(f">> MEMULAI ANALISIS {len(all_projects)} PROJECT...")
+        print("   (Harap tunggu, data akan disimpan setelah selesai)")
+        print("="*60)
+
+        for idx, proj in enumerate(all_projects):
+            try:
+                p_size, p_files, p_queue, p_root = analyze_single_project(proj, auth_headers, idx+1, len(all_projects))
+                PROJECT_CACHE[idx] = {
+                    'project': proj, # Object project disimpan sbg dict otomatis oleh json dump nanti
+                    'total_size': p_size,
+                    'total_files': p_files,
+                    'queue': p_queue,
+                    'download_root': p_root
+                }
+            except Exception as e:
+                print(f"\n[X] Error analyzing {proj['name']}: {e}")
+                PROJECT_CACHE[idx] = None 
+        
+        # Simpan ke file setelah scan selesai
+        save_cache_to_disk(PROJECT_CACHE)
 
     # --- 5. LOOP MENU UTAMA ---
     while True:
         print("\n" + "="*60)
-        print("   DAFTAR PROJECT (CACHE)")
+        print("   DAFTAR PROJECT")
         print("="*60)
         
         for idx, proj in enumerate(all_projects):
+            # Karena JSON load mengembalikan key sebagai int (sudah diconvert di func load), 
+            # kita bisa akses langsung.
             data = PROJECT_CACHE.get(idx)
+            
+            # Fallback jika cache tidak sinkron dengan jumlah project asli
+            if not data and use_cache:
+                print(f"[{idx+1}] {proj['name']:<30} | (Data tidak ada di cache - Rescan diperlukan)")
+                continue
+
             if data:
                 size_str = format_bytes(data['total_size'])
                 files_count = data['total_files']
@@ -498,7 +539,7 @@ def main():
                     selected_data = PROJECT_CACHE[idx]
                     break
                 else:
-                    print("Nomor tidak valid atau project error.")
+                    print("Nomor tidak valid atau data project kosong.")
             except ValueError:
                 print("Masukkan angka yang benar.")
 
@@ -508,13 +549,16 @@ def main():
         final_size = selected_data['total_size']
         human_size = format_bytes(final_size)
         
+        # Mengambil nama project (handle jika loaded from JSON 'project' is dict, or object from Gazu)
+        p_name = selected_data['project']['name'] if isinstance(selected_data['project'], dict) else selected_data['project']['name']
+
         if not final_queue:
-            print("\n!! Project ini kosong/tidak ada file. Kembali ke menu...")
+            print(f"\n!! Project '{p_name}' kosong. Kembali ke menu...")
             time.sleep(1)
             continue
 
         print("\n" + "="*60)
-        print(f"   DETAIL DOWNLOAD: {selected_data['project']['name']}")
+        print(f"   DETAIL DOWNLOAD: {p_name}")
         print(f"   Lokasi: {final_root}")
         print(f"   Total : {human_size} ({len(final_queue)} files)")
         print("="*60)
@@ -524,12 +568,11 @@ def main():
         if confirm != 'y':
             print(">> Kembali ke menu utama...")
             time.sleep(0.5)
-            continue # Kembali ke Loop Menu Utama
+            continue 
 
         # --- EKSEKUSI DOWNLOAD ---
         print("\n>> Memulai Download...")
-        try:
-            os.makedirs(final_root, exist_ok=True)
+        try: os.makedirs(final_root, exist_ok=True)
         except: pass
         
         success_count = 0
@@ -562,13 +605,11 @@ def main():
         print(f"Folder   : {final_root}")
         print("="*60)
 
-        # --- TANYA DOWNLOAD LAGI ---
         retry = input("\n>> Apakah Anda ingin download project lain? (y/n): ").lower().strip()
-        if retry == 'y':
-            continue # Kembali ke Loop Menu Utama
+        if retry == 'y': continue 
         else:
             print("Terima kasih. Keluar aplikasi.")
-            break # Break Loop Menu Utama (Exit Program)
+            break 
 
 if __name__ == "__main__":
     main()
