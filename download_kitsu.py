@@ -43,7 +43,7 @@ def format_bytes(size):
     except: return "Unknown"
 
 # ==========================================
-# CACHE FILE HANDLERS (BARU)
+# CACHE FILE HANDLERS
 # ==========================================
 
 def save_cache_to_disk(cache_data):
@@ -69,8 +69,6 @@ def load_cache_from_disk():
         with open(CACHE_FILENAME, 'r') as f:
             wrapper = json.load(f)
             
-        # JSON keys selalu string, kita harus convert keys kembali ke integer
-        # agar sesuai dengan index list project
         raw_data = wrapper.get("data", {})
         processed_data = {}
         for k, v in raw_data.items():
@@ -342,7 +340,7 @@ def scan_entity(entity, root_folder, entity_type, download_queue, seq_map, episo
     except Exception: pass
 
 def analyze_single_project(project, auth_headers, proj_idx, total_projects):
-    """Scan satu project dan return (total_size, total_files, download_queue)"""
+    """Scan satu project dan return (total_size, total_files, download_queue, root, total_shots)"""
     home_dir = os.path.expanduser("~")
     downloads_path = os.path.join(home_dir, "Downloads")
     folder_name = f"Kitsu_{sanitize(project['name'])}"
@@ -373,8 +371,12 @@ def analyze_single_project(project, auth_headers, proj_idx, total_projects):
 
     download_queue = []
     
+    # === MODIFIKASI: MENGHITUNG SHOT SECARA EKSPLISIT ===
     shots = gazu.shot.all_shots_for_project(project)
+    shot_count = len(shots) # Menghitung jumlah shot
+    
     assets = gazu.asset.all_assets_for_project(project)
+    
     total_items = len(shots) + len(assets)
     processed_count = 0
     
@@ -401,7 +403,8 @@ def analyze_single_project(project, auth_headers, proj_idx, total_projects):
     sys.stdout.write(f"\r>> [{proj_idx}/{total_projects}] Menganalisis '{project['name']}' ... [DONE] Found {len(download_queue)} files ({format_bytes(total_size)})   \n")
     sys.stdout.flush()
     
-    return total_size, len(download_queue), download_queue, download_root
+    # Mengembalikan shot_count juga
+    return total_size, len(download_queue), download_queue, download_root, shot_count
 
 # ==========================================
 # MAIN
@@ -468,10 +471,6 @@ def main():
         confirm_cache = input(">> Gunakan data lama (tidak perlu scan ulang)? (y/n): ").lower().strip()
         if confirm_cache == 'y':
             use_cache = True
-            # Kita perlu memetakan data cache ke project list saat ini
-            # Karena index mungkin berubah jika ada project baru, kita akan pakai scan sederhana
-            # Tapi untuk script ini, kita asumsi urutan project relatif sama atau kita mapping by index
-            # Note: Cache disimpan by index (0, 1, 2).
             PROJECT_CACHE = loaded_cache_data
             print("\n>> Data berhasil dimuat dari file.")
         else:
@@ -485,13 +484,15 @@ def main():
 
         for idx, proj in enumerate(all_projects):
             try:
-                p_size, p_files, p_queue, p_root = analyze_single_project(proj, auth_headers, idx+1, len(all_projects))
+                # Menangkap 5 variable return (ada p_shots)
+                p_size, p_files, p_queue, p_root, p_shots = analyze_single_project(proj, auth_headers, idx+1, len(all_projects))
                 PROJECT_CACHE[idx] = {
-                    'project': proj, # Object project disimpan sbg dict otomatis oleh json dump nanti
+                    'project': proj, 
                     'total_size': p_size,
                     'total_files': p_files,
                     'queue': p_queue,
-                    'download_root': p_root
+                    'download_root': p_root,
+                    'total_shots': p_shots # Simpan jumlah shot ke cache
                 }
             except Exception as e:
                 print(f"\n[X] Error analyzing {proj['name']}: {e}")
@@ -502,28 +503,28 @@ def main():
 
     # --- 5. LOOP MENU UTAMA ---
     while True:
-        print("\n" + "="*60)
+        print("\n" + "="*80) # Lebarkan sedikit agar muat
         print("   DAFTAR PROJECT")
-        print("="*60)
+        print("="*80)
         
         for idx, proj in enumerate(all_projects):
-            # Karena JSON load mengembalikan key sebagai int (sudah diconvert di func load), 
-            # kita bisa akses langsung.
             data = PROJECT_CACHE.get(idx)
             
-            # Fallback jika cache tidak sinkron dengan jumlah project asli
             if not data and use_cache:
-                print(f"[{idx+1}] {proj['name']:<30} | (Data tidak ada di cache - Rescan diperlukan)")
+                print(f"[{idx+1}] {proj['name']:<25} | (Data tidak ada di cache - Rescan diperlukan)")
                 continue
 
             if data:
                 size_str = format_bytes(data['total_size'])
                 files_count = data['total_files']
-                print(f"[{idx+1}] {proj['name']:<30} | Size: {size_str:<10} | Files: {files_count}")
+                # Ambil total shot (fallback ke '-' jika cache lama belum ada datanya)
+                shots_count = data.get('total_shots', '-') 
+                
+                print(f"[{idx+1}] {proj['name']:<25} | Size: {size_str:<9} | Files: {files_count:<5} | Shots: {shots_count}")
             else:
-                print(f"[{idx+1}] {proj['name']:<30} | (Gagal Analisis)")
+                print(f"[{idx+1}] {proj['name']:<25} | (Gagal Analisis)")
 
-        print("-" * 60)
+        print("-" * 80)
         
         # --- PILIH PROJECT ---
         selected_data = None
@@ -548,8 +549,8 @@ def main():
         final_root = selected_data['download_root']
         final_size = selected_data['total_size']
         human_size = format_bytes(final_size)
+        total_shots = selected_data.get('total_shots', 'Unknown')
         
-        # Mengambil nama project (handle jika loaded from JSON 'project' is dict, or object from Gazu)
         p_name = selected_data['project']['name'] if isinstance(selected_data['project'], dict) else selected_data['project']['name']
 
         if not final_queue:
@@ -559,8 +560,10 @@ def main():
 
         print("\n" + "="*60)
         print(f"   DETAIL DOWNLOAD: {p_name}")
-        print(f"   Lokasi: {final_root}")
-        print(f"   Total : {human_size} ({len(final_queue)} files)")
+        print(f"   Lokasi      : {final_root}")
+        print(f"   Total Shots : {total_shots}")
+        print(f"   Total Files : {len(final_queue)} files")
+        print(f"   Total Size  : {human_size}")
         print("="*60)
         
         confirm = input(">> Mulai download sekarang? (y/n): ").lower().strip()
